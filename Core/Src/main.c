@@ -48,15 +48,20 @@ DMA_HandleTypeDef hdma_spi1_rx;
 
 /* USER CODE BEGIN PV */
 /* I2S DMA buffer.
- * I2S sends stereo frames (L+R), each 24-bit valid in a 32-bit slot. The HAL
- * does this as two 16-bit DMA transfers per channel, which the DMA packs into
- * one uint32 per channel sample. So I2S_BUF_SIZE uint32 elements hold
- * I2S_BUF_SIZE/2 stereo frames = I2S_BUF_SIZE/2 mono samples after we drop
- * the right channel. At 16 kHz: 64 uint32 -> 32 mono samples -> 2 ms.
+ * I2S sends stereo frames (L+R), each a 24-bit sample left-justified in a
+ * 32-bit channel slot. With DMA configured as PSIZE=HALFWORD + MSIZE=WORD
+ * (see HAL_I2S_MspInit), the DMA packs every two 16-bit reads from SPI_DR
+ * into one 32-bit memory write. So each uint32 in i2s_rx_buf holds exactly
+ * one full 32-bit audio slot (one channel), in this layout:
+ *     bits  0..15  = upper 16 bits of the 24-bit sample (bits 23..8)
+ *     bits 16..31  = lower 8 bits (left-justified, padded with zeros)
  *
- * The half-complete callback fires after the first half is filled (16 mono
- * samples = 1 ms), the full-complete callback after the second half — which
- * matches exactly one USB 1 ms isochronous frame.
+ * I2S_BUF_SIZE = number of uint32 channel slots in the buffer
+ *              = number of mono audio samples per buffer (after dropping R)
+ *              × 2 (for stereo)
+ * At 16 kHz, 64 slots = 32 stereo frames = 32 mono samples = 2 ms total,
+ * so each half-complete callback covers exactly 1 ms (16 mono samples),
+ * matching one USB 1 ms isochronous frame.
  */
 #define I2S_BUF_SIZE 64
 uint32_t i2s_rx_buf[I2S_BUF_SIZE];
@@ -120,9 +125,20 @@ int main(void)
     static uint8_t dma_started = 0;
     if (!dma_started && hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED)
     {
-      // I2S_BUF_SIZE * 2 = 128 half-words → pełny bufor uint32_t[64]
-      // Daje 1ms na każdy half-complete (= 1 USB frame)
-      HAL_I2S_Receive_DMA(&hi2s1, (uint16_t*)i2s_rx_buf, I2S_BUF_SIZE * 2);
+      /* For I2S_DATAFORMAT_24B the HAL interprets `Size` as the number of
+       * audio samples (24-bit in 32-bit slots), and internally doubles it
+       * to NDTR (half-word transfers). With PSIZE=HALFWORD + MSIZE=WORD,
+       * the DMA packs every two 16-bit reads from SPI_DR into one 32-bit
+       * memory write — so each uint32 in i2s_rx_buf holds exactly one
+       * 32-bit audio channel slot (low 16 bits = upper 16 bits of the
+       * 24-bit sample, high 16 bits = the remaining 8 bits left-justified).
+       *
+       * Sizing: I2S_BUF_SIZE (= 64) audio samples = 32 stereo frames
+       *   -> HAL NDTR = 128 half-word reads
+       *   -> 64 word writes to memory = exactly i2s_rx_buf (256 bytes)
+       *   -> half-complete fires every 16 stereo frames = 1 ms @ 16 kHz
+       *      (matches one USB isochronous frame). */
+      HAL_I2S_Receive_DMA(&hi2s1, (uint16_t*)i2s_rx_buf, I2S_BUF_SIZE);
       dma_started = 1;
     }
     /* USER CODE END WHILE */
