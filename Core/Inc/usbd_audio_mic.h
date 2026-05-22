@@ -66,6 +66,12 @@ typedef struct {
      * USBD_LL_Transmit only sets up the transfer and returns. */
     int16_t  tx_pkt[AUDIO_MIC_PACKET_SAMPLES];
 
+    /* tx_busy = 1 when a packet has been handed to USBD_LL_Transmit and we
+     * have not yet seen the matching DataIn / IsoINIncomplete completion.
+     * SOF uses this as the "must I bootstrap?" flag — primary re-arm is still
+     * DataIn (after success) and IsoINIncomplete (after host miss). */
+    volatile uint8_t tx_busy;
+
     /* EP0 control transfer scratch area for SET_CUR.
      * ctl_target  = 1 -> interface (feature unit)
      *             = 2 -> endpoint (sampling frequency)

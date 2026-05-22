@@ -35,6 +35,7 @@ static uint8_t *USBD_AUDIO_MIC_GetCfgDesc(uint16_t *length);
 static uint8_t *USBD_AUDIO_MIC_GetDeviceQualifierDesc(uint16_t *length);
 static uint8_t  USBD_AUDIO_MIC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum);
 static uint8_t  USBD_AUDIO_MIC_EP0_RxReady(USBD_HandleTypeDef *pdev);
+static uint8_t  USBD_AUDIO_MIC_SOF(USBD_HandleTypeDef *pdev);
 static uint8_t  USBD_AUDIO_MIC_IsoINIncomplete(USBD_HandleTypeDef *pdev, uint8_t epnum);
 
 static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev,
@@ -56,7 +57,7 @@ USBD_ClassTypeDef USBD_AUDIO_MIC = {
     USBD_AUDIO_MIC_EP0_RxReady,
     USBD_AUDIO_MIC_DataIn,
     NULL,                              /* DataOut     */
-    NULL,                              /* SOF         */
+    USBD_AUDIO_MIC_SOF,
     USBD_AUDIO_MIC_IsoINIncomplete,
     NULL,                              /* IsoOUTIncomplete */
 #ifdef USE_USBD_COMPOSITE
@@ -326,21 +327,18 @@ static uint8_t USBD_AUDIO_MIC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTyped
 
                 if (intf == AUDIO_MIC_AS_INTERFACE && new_alt <= 1U) {
                     haudio->alt_setting = new_alt;
-                    if (new_alt == 1U) {
-                        /* Always (re)prime, regardless of previous alt — the
-                         * host may re-issue SET_INTERFACE(alt=1) as part of
-                         * error recovery and the EP may be in an unknown
-                         * state. */
-                        haudio->wr_idx = 0U;
-                        haudio->rd_idx = 0U;
-                        memset(haudio->tx_pkt, 0, sizeof(haudio->tx_pkt));
-                        (void)USBD_LL_FlushEP(pdev, AUDIO_MIC_IN_EP);
-                        (void)USBD_LL_Transmit(pdev, AUDIO_MIC_IN_EP,
-                                               (uint8_t *)haudio->tx_pkt,
-                                               AUDIO_MIC_PACKET_SIZE);
-                    } else {
-                        (void)USBD_LL_FlushEP(pdev, AUDIO_MIC_IN_EP);
-                    }
+                    haudio->wr_idx      = 0U;
+                    haudio->rd_idx      = 0U;
+                    haudio->tx_busy     = 0U;
+                    memset(haudio->tx_pkt, 0, sizeof(haudio->tx_pkt));
+                    /* Flush any stale FIFO contents from a previous session.
+                     * Do NOT prime here — the SOF callback will pump the very
+                     * first packet on the next start-of-frame (≤ 1 ms later).
+                     * This is far more robust than trying to USBD_LL_Transmit
+                     * from inside the EP0 setup IRQ, where the OTG core may
+                     * still be in the middle of processing the control
+                     * transfer for EP0. */
+                    (void)USBD_LL_FlushEP(pdev, AUDIO_MIC_IN_EP);
                 } else if (intf == AUDIO_MIC_AC_INTERFACE && new_alt == 0U) {
                     /* AC interface only has alt 0 — ack silently. */
                 } else {
@@ -387,6 +385,11 @@ static uint8_t *USBD_AUDIO_MIC_GetDeviceQualifierDesc(uint16_t *length)
 static uint8_t USBD_AUDIO_MIC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
 {
     if ((epnum & 0x7FU) == (AUDIO_MIC_IN_EP & 0x7FU)) {
+        USBD_AUDIO_MIC_HandleTypeDef *haudio =
+            (USBD_AUDIO_MIC_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+        if (haudio != NULL) {
+            haudio->tx_busy = 0U;
+        }
         AUDIO_MIC_SendNextPacket(pdev);
     }
     return (uint8_t)USBD_OK;
@@ -434,9 +437,34 @@ static uint8_t USBD_AUDIO_MIC_IsoINIncomplete(USBD_HandleTypeDef *pdev, uint8_t 
         return (uint8_t)USBD_OK;
     }
 
-    /* Host missed our IN window — flush the stale packet and re-arm. */
+    /* Host missed our IN window — flush the stale packet, mark EP idle, and
+     * re-arm immediately. SOF will also try to bootstrap if for any reason
+     * this re-arm does not stick. */
     (void)USBD_LL_FlushEP(pdev, AUDIO_MIC_IN_EP);
+    haudio->tx_busy = 0U;
     AUDIO_MIC_SendNextPacket(pdev);
+    return (uint8_t)USBD_OK;
+}
+
+static uint8_t USBD_AUDIO_MIC_SOF(USBD_HandleTypeDef *pdev)
+{
+    USBD_AUDIO_MIC_HandleTypeDef *haudio =
+        (USBD_AUDIO_MIC_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
+    if (haudio == NULL || haudio->alt_setting != 1U) {
+        return (uint8_t)USBD_OK;
+    }
+
+    /* If no packet is currently in flight (no DataIn pending), prime one.
+     * This handles:
+     *   - The very first packet right after SET_INTERFACE(alt=1).
+     *   - Any silent failure of DataIn / IsoINIncomplete re-arm.
+     *   - Recovery from edge cases where EPENA somehow got cleared without
+     *     us being notified.
+     * Cost: at most one USBD_LL_Transmit per 1 ms frame in pathological
+     * cases, which is exactly the cadence we want anyway. */
+    if (haudio->tx_busy == 0U) {
+        AUDIO_MIC_SendNextPacket(pdev);
+    }
     return (uint8_t)USBD_OK;
 }
 
@@ -543,6 +571,11 @@ static void AUDIO_MIC_SendNextPacket(USBD_HandleTypeDef *pdev)
     if (haudio == NULL || haudio->alt_setting != 1U) {
         return;
     }
+    /* Reentrancy / double-arm guard: skip if a packet is already in flight
+     * (set by ourselves, cleared by DataIn or IsoINIncomplete). */
+    if (haudio->tx_busy) {
+        return;
+    }
 
     const uint16_t ring_n = AUDIO_MIC_RING_SAMPLES;
     const uint16_t pkt_n  = AUDIO_MIC_PACKET_SAMPLES;
@@ -569,6 +602,7 @@ static void AUDIO_MIC_SendNextPacket(USBD_HandleTypeDef *pdev)
         memset(haudio->tx_pkt, 0, sizeof(haudio->tx_pkt));
     }
 
+    haudio->tx_busy = 1U;
     (void)USBD_LL_Transmit(pdev, AUDIO_MIC_IN_EP,
                            (uint8_t *)haudio->tx_pkt,
                            AUDIO_MIC_PACKET_SIZE);
