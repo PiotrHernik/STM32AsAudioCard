@@ -66,9 +66,16 @@ typedef struct {
      * USBD_LL_Transmit only sets up the transfer and returns. */
     int16_t  tx_pkt[AUDIO_MIC_PACKET_SAMPLES];
 
-    /* EP0 control transfer scratch area for SET_CUR. */
+    /* EP0 control transfer scratch area for SET_CUR.
+     * ctl_target  = 1 -> interface (feature unit)
+     *             = 2 -> endpoint (sampling frequency)
+     * ctl_unit    = HIBYTE(wIndex)  (unit ID for IF target, undefined for EP)
+     * ctl_cs      = HIBYTE(wValue)  (control selector)
+     */
     uint8_t  ctl_cmd;
+    uint8_t  ctl_target;
     uint8_t  ctl_unit;
+    uint8_t  ctl_cs;
     uint8_t  ctl_len;
     uint8_t  ctl_data[8];
 } USBD_AUDIO_MIC_HandleTypeDef;

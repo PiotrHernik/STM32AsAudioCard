@@ -37,8 +37,12 @@ static uint8_t  USBD_AUDIO_MIC_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum);
 static uint8_t  USBD_AUDIO_MIC_EP0_RxReady(USBD_HandleTypeDef *pdev);
 static uint8_t  USBD_AUDIO_MIC_IsoINIncomplete(USBD_HandleTypeDef *pdev, uint8_t epnum);
 
-static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
-static void AUDIO_MIC_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev,
+                                     USBD_SetupReqTypedef *req,
+                                     uint8_t recipient);
+static void AUDIO_MIC_REQ_SetCurrent(USBD_HandleTypeDef *pdev,
+                                     USBD_SetupReqTypedef *req,
+                                     uint8_t recipient);
 static void AUDIO_MIC_SendNextPacket(USBD_HandleTypeDef *pdev);
 
 /* ============================================================================
@@ -200,7 +204,7 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_MIC_CfgDesc[USBD_AUDIO_MIC_CONFIG_DESC_S
     0x07,
     0x25,                              /* CS_ENDPOINT */
     0x01,                              /* EP_GENERAL */
-    0x00,                              /* bmAttributes: no sampling freq ctrl */
+    0x01,                              /* bmAttributes: Sampling Frequency Control supported */
     0x00,                              /* bLockDelayUnits */
     0x00, 0x00,                        /* wLockDelay */
 };
@@ -270,13 +274,18 @@ static uint8_t USBD_AUDIO_MIC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTyped
 
     switch (req->bmRequest & USB_REQ_TYPE_MASK) {
     /* ---------- Class-specific (audio) requests ---------- */
-    case USB_REQ_TYPE_CLASS:
+    case USB_REQ_TYPE_CLASS: {
+        /* Recipient bits 0..4 of bmRequestType: 1 = interface, 2 = endpoint. */
+        uint8_t recipient = req->bmRequest & 0x1FU;
         switch (req->bRequest) {
         case 0x81U:  /* GET_CUR */
-            AUDIO_MIC_REQ_GetCurrent(pdev, req);
+        case 0x82U:  /* GET_MIN */
+        case 0x83U:  /* GET_MAX */
+        case 0x84U:  /* GET_RES */
+            AUDIO_MIC_REQ_GetCurrent(pdev, req, recipient);
             break;
         case 0x01U:  /* SET_CUR */
-            AUDIO_MIC_REQ_SetCurrent(pdev, req);
+            AUDIO_MIC_REQ_SetCurrent(pdev, req, recipient);
             break;
         default:
             USBD_CtlError(pdev, req);
@@ -284,6 +293,7 @@ static uint8_t USBD_AUDIO_MIC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTyped
             break;
         }
         break;
+    }
 
     /* ---------- Standard requests targeted at our interface ---------- */
     case USB_REQ_TYPE_STANDARD:
@@ -391,11 +401,24 @@ static uint8_t USBD_AUDIO_MIC_EP0_RxReady(USBD_HandleTypeDef *pdev)
     }
 
     if (haudio->ctl_cmd == 0x01U /* SET_CUR */) {
-        if (haudio->ctl_unit == AUDIO_MIC_FEATURE_UNIT_ID) {
+        if (haudio->ctl_target == 0x01U
+            && haudio->ctl_unit == AUDIO_MIC_FEATURE_UNIT_ID
+            && haudio->ctl_cs == 0x01U /* MUTE */) {
             haudio->mute = haudio->ctl_data[0];
+        } else if (haudio->ctl_target == 0x02U
+                   && haudio->ctl_cs == 0x01U /* SAMPLING_FREQ */) {
+            /* Single-rate device: accept the rate iff it matches, ignore otherwise.
+             * (We already filtered wLength==3 in Setup, so reading 3 bytes is safe.) */
+            uint32_t rate = (uint32_t)haudio->ctl_data[0]
+                          | ((uint32_t)haudio->ctl_data[1] << 8)
+                          | ((uint32_t)haudio->ctl_data[2] << 16);
+            (void)rate; /* nothing to actually change — we are fixed-rate */
         }
-        haudio->ctl_cmd = 0U;
-        haudio->ctl_len = 0U;
+        haudio->ctl_cmd    = 0U;
+        haudio->ctl_target = 0U;
+        haudio->ctl_unit   = 0U;
+        haudio->ctl_cs     = 0U;
+        haudio->ctl_len    = 0U;
     }
     return (uint8_t)USBD_OK;
 }
@@ -420,7 +443,9 @@ static uint8_t USBD_AUDIO_MIC_IsoINIncomplete(USBD_HandleTypeDef *pdev, uint8_t 
 /* ============================================================================
  *                           Control transfer helpers
  * ==========================================================================*/
-static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev,
+                                     USBD_SetupReqTypedef *req,
+                                     uint8_t recipient)
 {
     USBD_AUDIO_MIC_HandleTypeDef *haudio =
         (USBD_AUDIO_MIC_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
@@ -428,35 +453,82 @@ static void AUDIO_MIC_REQ_GetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqType
         return;
     }
 
-    uint8_t unit = HIBYTE(req->wIndex);
     uint8_t cs   = HIBYTE(req->wValue);
+    uint8_t unit = HIBYTE(req->wIndex);
 
     memset(haudio->ctl_data, 0, sizeof(haudio->ctl_data));
+    uint16_t respond_len = 0U;
+    uint8_t  stall       = 1U;
 
-    if (unit == AUDIO_MIC_FEATURE_UNIT_ID && cs == 0x01U /* MUTE */) {
-        haudio->ctl_data[0] = haudio->mute;
+    if (recipient == 0x01U /* interface (feature unit) */) {
+        if (unit == AUDIO_MIC_FEATURE_UNIT_ID && cs == 0x01U /* MUTE */) {
+            /* Only GET_CUR makes sense for MUTE; GET_MIN/MAX/RES → stall. */
+            if (req->bRequest == 0x81U) {
+                haudio->ctl_data[0] = haudio->mute;
+                respond_len = 1U;
+                stall = 0U;
+            }
+        }
+    } else if (recipient == 0x02U /* endpoint */) {
+        if (cs == 0x01U /* SAMPLING_FREQ_CONTROL */) {
+            /* Single supported rate — report it for GET_CUR/MIN/MAX, 0 for RES. */
+            uint32_t freq = (req->bRequest == 0x84U) ? 0U
+                                                     : (uint32_t)USBD_AUDIO_MIC_FREQ;
+            haudio->ctl_data[0] = (uint8_t)(freq & 0xFFU);
+            haudio->ctl_data[1] = (uint8_t)((freq >> 8) & 0xFFU);
+            haudio->ctl_data[2] = (uint8_t)((freq >> 16) & 0xFFU);
+            respond_len = 3U;
+            stall = 0U;
+        }
     }
-    /* Any other selector returns zeros, which is benign. */
 
-    uint16_t len = (req->wLength < sizeof(haudio->ctl_data))
-                 ? req->wLength
-                 : (uint16_t)sizeof(haudio->ctl_data);
+    if (stall) {
+        USBD_CtlError(pdev, req);
+        return;
+    }
+
+    uint16_t len = (req->wLength < respond_len) ? req->wLength : respond_len;
     (void)USBD_CtlSendData(pdev, haudio->ctl_data, len);
 }
 
-static void AUDIO_MIC_REQ_SetCurrent(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+static void AUDIO_MIC_REQ_SetCurrent(USBD_HandleTypeDef *pdev,
+                                     USBD_SetupReqTypedef *req,
+                                     uint8_t recipient)
 {
     USBD_AUDIO_MIC_HandleTypeDef *haudio =
         (USBD_AUDIO_MIC_HandleTypeDef *)pdev->pClassDataCmsit[pdev->classId];
     if (haudio == NULL || req->wLength == 0U) {
+        USBD_CtlError(pdev, req);
         return;
     }
 
-    haudio->ctl_cmd  = 0x01U; /* SET_CUR */
-    haudio->ctl_unit = HIBYTE(req->wIndex);
-    haudio->ctl_len  = (req->wLength < sizeof(haudio->ctl_data))
-                     ? (uint8_t)req->wLength
-                     : (uint8_t)sizeof(haudio->ctl_data);
+    uint8_t cs   = HIBYTE(req->wValue);
+    uint8_t unit = HIBYTE(req->wIndex);
+    uint8_t accept = 0U;
+
+    if (recipient == 0x01U /* interface (feature unit) */) {
+        if (unit == AUDIO_MIC_FEATURE_UNIT_ID && cs == 0x01U /* MUTE */
+            && req->wLength == 1U) {
+            accept = 1U;
+        }
+    } else if (recipient == 0x02U /* endpoint */) {
+        if (cs == 0x01U /* SAMPLING_FREQ_CONTROL */ && req->wLength == 3U) {
+            accept = 1U;
+        }
+    }
+
+    if (!accept) {
+        USBD_CtlError(pdev, req);
+        return;
+    }
+
+    haudio->ctl_cmd    = 0x01U; /* SET_CUR */
+    haudio->ctl_target = recipient;
+    haudio->ctl_unit   = unit;
+    haudio->ctl_cs     = cs;
+    haudio->ctl_len    = (req->wLength < sizeof(haudio->ctl_data))
+                       ? (uint8_t)req->wLength
+                       : (uint8_t)sizeof(haudio->ctl_data);
 
     (void)USBD_CtlPrepareRx(pdev, haudio->ctl_data, haudio->ctl_len);
 }
