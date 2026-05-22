@@ -315,12 +315,12 @@ static uint8_t USBD_AUDIO_MIC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTyped
                 uint8_t new_alt = LOBYTE(req->wValue);
 
                 if (intf == AUDIO_MIC_AS_INTERFACE && new_alt <= 1U) {
-                    uint8_t was = haudio->alt_setting;
                     haudio->alt_setting = new_alt;
-
-                    if (new_alt == 1U && was == 0U) {
-                        /* Streaming starts: reset ring and prime first packet
-                         * with silence so the host gets immediate data. */
+                    if (new_alt == 1U) {
+                        /* Always (re)prime, regardless of previous alt — the
+                         * host may re-issue SET_INTERFACE(alt=1) as part of
+                         * error recovery and the EP may be in an unknown
+                         * state. */
                         haudio->wr_idx = 0U;
                         haudio->rd_idx = 0U;
                         memset(haudio->tx_pkt, 0, sizeof(haudio->tx_pkt));
@@ -328,7 +328,7 @@ static uint8_t USBD_AUDIO_MIC_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTyped
                         (void)USBD_LL_Transmit(pdev, AUDIO_MIC_IN_EP,
                                                (uint8_t *)haudio->tx_pkt,
                                                AUDIO_MIC_PACKET_SIZE);
-                    } else if (new_alt == 0U && was == 1U) {
+                    } else {
                         (void)USBD_LL_FlushEP(pdev, AUDIO_MIC_IN_EP);
                     }
                 } else if (intf == AUDIO_MIC_AC_INTERFACE && new_alt == 0U) {
