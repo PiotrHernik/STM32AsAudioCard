@@ -2,9 +2,11 @@
   ******************************************************************************
   * @file    usbd_audio_mic.h
   * @brief   USB Audio Class 1.0 microphone (IN) implementation.
-  *          Mono, 16-bit PCM, fixed sample rate (USBD_AUDIO_MIC_FREQ).
+  *          Mono, 24-bit PCM packed in 3 bytes (S24_3LE), fixed sample rate.
   *          Designed as a drop-in replacement for the ST USBD_AUDIO class
-  *          when the device must act as a USB microphone.
+  *          when the device must act as a USB microphone with full dynamic
+  *          range (ICS43434 outputs 24-bit data on I2S, and the lower bits
+  *          contain real signal that we don't want to truncate in firmware).
   ******************************************************************************
   */
 
@@ -22,14 +24,16 @@ extern "C" {
 #define USBD_AUDIO_MIC_FREQ                 16000U
 #endif
 #define USBD_AUDIO_MIC_CHANNELS             1U
-#define USBD_AUDIO_MIC_BITS                 16U
+#define USBD_AUDIO_MIC_BITS                 24U
+#define USBD_AUDIO_MIC_BYTES_PER_SAMPLE     3U  /* S24_3LE: 24-bit packed in 3 bytes */
 
-/* Bytes per 1ms USB frame (one isochronous packet). */
+/* Bytes per 1ms USB frame (one isochronous packet).
+ *   16 kHz * 1 channel * 3 bytes = 48 bytes/ms — well within FS isoc limits. */
 #define AUDIO_MIC_PACKET_SIZE \
-    ((USBD_AUDIO_MIC_FREQ / 1000U) * USBD_AUDIO_MIC_CHANNELS * (USBD_AUDIO_MIC_BITS / 8U))
+    ((USBD_AUDIO_MIC_FREQ / 1000U) * USBD_AUDIO_MIC_CHANNELS * USBD_AUDIO_MIC_BYTES_PER_SAMPLE)
 
-/* Samples per packet (int16_t units). */
-#define AUDIO_MIC_PACKET_SAMPLES            (AUDIO_MIC_PACKET_SIZE / 2U)
+/* Samples per packet (one sample = one 24-bit value). */
+#define AUDIO_MIC_PACKET_SAMPLES            (AUDIO_MIC_PACKET_SIZE / USBD_AUDIO_MIC_BYTES_PER_SAMPLE)
 
 /* ===== USB topology constants ===== */
 #define AUDIO_MIC_IN_EP                     0x81U
@@ -56,15 +60,20 @@ typedef struct {
     uint8_t  mute;                              /* Mute state (0/1) */
 
     /* Single-producer (I2S IRQ) / single-consumer (USB IRQ) ring buffer.
-     * Indices are in samples (int16_t units). volatile because they are
-     * exchanged between two IRQ contexts. */
-    int16_t  ring[AUDIO_MIC_RING_SAMPLES];
+     * Each slot stores one full I2S word with the 24-bit sample in bits
+     * [31:8] (sign-extended via the int32 representation) and bits [7:0]
+     * zero — i.e. exactly the raw layout coming out of the I2S DMA. We
+     * pack to 3-byte little-endian only when copying into tx_pkt, so the
+     * full precision is preserved end-to-end through firmware. Indices
+     * are in samples; volatile because they cross IRQ contexts. */
+    int32_t  ring[AUDIO_MIC_RING_SAMPLES];
     volatile uint16_t wr_idx;
     volatile uint16_t rd_idx;
 
     /* Outgoing packet buffer, must persist across DataIn callbacks because
-     * USBD_LL_Transmit only sets up the transfer and returns. */
-    int16_t  tx_pkt[AUDIO_MIC_PACKET_SAMPLES];
+     * USBD_LL_Transmit only sets up the transfer and returns. Holds the
+     * already-packed S24_3LE bytes ready to go on the wire. */
+    uint8_t  tx_pkt[AUDIO_MIC_PACKET_SIZE];
 
     /* tx_busy = 1 when a packet has been handed to USBD_LL_Transmit and we
      * have not yet seen the matching DataIn / IsoINIncomplete completion.
@@ -89,9 +98,13 @@ typedef struct {
 extern USBD_ClassTypeDef USBD_AUDIO_MIC;
 #define USBD_AUDIO_MIC_CLASS &USBD_AUDIO_MIC
 
-/* Producer API: push `count` int16 mono samples into the ring buffer.
- * Safe to call from an interrupt at lower priority than the USB IRQ. */
-void USBD_AUDIO_MIC_PushSamples(const int16_t *samples, uint16_t count);
+/* Producer API: push `count` mono samples into the ring buffer.
+ * Each sample is a raw 32-bit I2S slot value: 24-bit signed sample in
+ * bits [31:8] (sign-extended for negative samples), bits [7:0] = 0.
+ * This matches what the I2S DMA delivers, so no conversion is required
+ * on the producer side. Safe to call from an interrupt at lower priority
+ * than the USB IRQ. */
+void USBD_AUDIO_MIC_PushSamples(const int32_t *samples, uint16_t count);
 
 #ifdef __cplusplus
 }

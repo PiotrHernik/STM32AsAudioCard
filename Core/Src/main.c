@@ -25,6 +25,7 @@
 #include "usbd_audio_mic.h"   // USBD_AUDIO_MIC_PushSamples()
 #include "usbd_core.h"        // USBD_STATE_CONFIGURED
 #include <string.h>           // memset
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -265,22 +266,40 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* Convert one half of the I2S DMA buffer into mono int16 samples and push
- * them to the USB microphone class ring buffer. We drop the right channel
- * (ICS43434 is mono — by default only the left slot carries real data).
+/* Convert one I2S channel slot (uint32 as packed by DMA) back into the
+ * raw 32-bit I2S word so we can stream the full 24-bit precision to the
+ * host. No gain, no truncation — we want every bit of dynamic range
+ * preserved for downstream DSP (beamforming, drone-noise suppression,
+ * far-field target extraction). The host can boost / filter / clip
+ * later with full information; once we throw bits away in firmware
+ * they are gone forever.
  *
- * Per-uint32 sample layout: STM32 I2S in 24-bit Philips mode does MSB-first
- * 16-bit DMA transfers; the first 16-bit word (the MSB of the 24-bit sample)
- * lands in the low half of the uint32, the second one in the high half.
- * Taking the lower 16 bits and casting to int16_t therefore yields the top
- * 16 bits of the original signed 24-bit sample with the sign preserved.
- */
-static void mic_push_half(const uint32_t *frames, uint16_t stereo_count)
+ * DMA layout (PSIZE=HALFWORD, MSIZE=WORD) packs two 16-bit reads from
+ * SPI_DR into one 32-bit memory word:
+ *   - low 16 bits  = first half-word received  = slot bits [31:16]
+ *                                              = sample bits [23:8]
+ *   - high 16 bits = second half-word received = slot bits [15:0]
+ *                                              = sample bits [7:0] << 8
+ * Reassembling them gives the original 32-bit I2S slot with the 24-bit
+ * signed sample in bits [31:8] and bits [7:0] = 0. The USB class then
+ * packs this into 3-byte little-endian S24_3LE for transmission. */
+static inline int32_t i2s_slot_to_int32(uint32_t frame)
 {
-    int16_t mono[I2S_BUF_SIZE / 4]; /* worst case = 16 samples */
+    uint16_t hi = (uint16_t)(frame & 0xFFFFU);
+    uint16_t lo = (uint16_t)((frame >> 16) & 0xFFFFU);
+    return (int32_t)(((uint32_t)hi << 16) | (uint32_t)lo);
+}
+
+/* Convert one half of the I2S DMA buffer into mono int32 samples and push
+ * them to the USB microphone class ring buffer. The ICS43434 is a mono
+ * mic; with L/R = GND it puts data on the left channel slot, so we take
+ * every other uint32 (even indices = L slots, odd = R slot which is mute). */
+static void mic_push_half(const uint32_t *frames, uint16_t slot_count)
+{
+    int32_t mono[I2S_BUF_SIZE / 4]; /* worst case = 16 samples per 1 ms */
     uint16_t n = 0U;
-    for (uint16_t i = 0U; i < stereo_count; i += 2U) {
-        mono[n++] = (int16_t)(frames[i] & 0xFFFFU);
+    for (uint16_t i = 0U; i < slot_count; i += 2U) {
+        mono[n++] = i2s_slot_to_int32(frames[i]);
     }
     USBD_AUDIO_MIC_PushSamples(mono, n);
 }

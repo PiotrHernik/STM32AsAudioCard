@@ -186,8 +186,8 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_MIC_CfgDesc[USBD_AUDIO_MIC_CONFIG_DESC_S
     0x02,                              /* FORMAT_TYPE */
     0x01,                              /* FORMAT_TYPE_I */
     USBD_AUDIO_MIC_CHANNELS,           /* bNrChannels */
-    (USBD_AUDIO_MIC_BITS / 8U),        /* bSubFrameSize */
-    USBD_AUDIO_MIC_BITS,               /* bBitResolution */
+    USBD_AUDIO_MIC_BYTES_PER_SAMPLE,   /* bSubFrameSize = 3 bytes (S24_3LE) */
+    USBD_AUDIO_MIC_BITS,               /* bBitResolution = 24 valid bits */
     0x01,                              /* bSamFreqType = 1 (one discrete freq) */
     AUDIO_FREQ_B0, AUDIO_FREQ_B1, AUDIO_FREQ_B2,
 
@@ -590,8 +590,21 @@ static void AUDIO_MIC_SendNextPacket(USBD_HandleTypeDef *pdev)
             memset(haudio->tx_pkt, 0, sizeof(haudio->tx_pkt));
             rd = (uint16_t)((rd + pkt_n) % ring_n);
         } else {
+            /* Pack each int32 ring slot into 3 little-endian bytes.
+             * Ring layout: 24-bit sample in bits [31:8], bits [7:0] = 0.
+             * S24_3LE wants bytes b0=LSB..b2=MSB of the 24-bit sample, so:
+             *     b0 = ring_slot[15:8]   (sample bits 7:0)
+             *     b1 = ring_slot[23:16]  (sample bits 15:8)
+             *     b2 = ring_slot[31:24]  (sample bits 23:16, sign byte)
+             * Using an unsigned cast for the shift so we never depend on
+             * the implementation-defined sign behaviour of int32 shifts. */
+            uint8_t *out = haudio->tx_pkt;
             for (uint16_t i = 0U; i < pkt_n; ++i) {
-                haudio->tx_pkt[i] = haudio->ring[rd];
+                uint32_t s = (uint32_t)haudio->ring[rd];
+                out[0] = (uint8_t)((s >> 8)  & 0xFFU);
+                out[1] = (uint8_t)((s >> 16) & 0xFFU);
+                out[2] = (uint8_t)((s >> 24) & 0xFFU);
+                out += USBD_AUDIO_MIC_BYTES_PER_SAMPLE;
                 rd = (uint16_t)((rd + 1U) % ring_n);
             }
         }
@@ -604,14 +617,14 @@ static void AUDIO_MIC_SendNextPacket(USBD_HandleTypeDef *pdev)
 
     haudio->tx_busy = 1U;
     (void)USBD_LL_Transmit(pdev, AUDIO_MIC_IN_EP,
-                           (uint8_t *)haudio->tx_pkt,
+                           haudio->tx_pkt,
                            AUDIO_MIC_PACKET_SIZE);
 }
 
 /* ============================================================================
  *                  Public producer API (called from I2S IRQ)
  * ==========================================================================*/
-void USBD_AUDIO_MIC_PushSamples(const int16_t *samples, uint16_t count)
+void USBD_AUDIO_MIC_PushSamples(const int32_t *samples, uint16_t count)
 {
     if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED) {
         return;
