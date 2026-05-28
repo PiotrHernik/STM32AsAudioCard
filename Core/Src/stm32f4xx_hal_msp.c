@@ -23,6 +23,7 @@
 
 /* USER CODE END Includes */
 extern DMA_HandleTypeDef hdma_spi1_rx;
+extern DMA_HandleTypeDef hdma_spi3_rx;
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -109,9 +110,9 @@ void HAL_I2S_MspInit(I2S_HandleTypeDef* hi2s)
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     /**I2S1 GPIO Configuration
-    PA4     ------> I2S1_WS
-    PA5     ------> I2S1_CK
-    PA7     ------> I2S1_SD
+    PA4     ------> I2S1_WS   (drives WS for ALL 4 mics — jumper to PA15)
+    PA5     ------> I2S1_CK   (drives BCLK for ALL 4 mics — jumper to PB3)
+    PA7     ------> I2S1_SD   (data line for mic1 SEL=GND and mic2 SEL=VDD)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -144,6 +145,65 @@ void HAL_I2S_MspInit(I2S_HandleTypeDef* hi2s)
     /* USER CODE END SPI1_MspInit 1 */
 
   }
+  else if(hi2s->Instance==SPI3)
+  {
+    /* SPI3 / I2S3 — slave RX for the second mic pair (mic3 + mic4).
+     * It must reuse the same PLLI2S kernel as SPI1 because the BCLK/WS are
+     * physically driven by SPI1 (jumper wires PA4->PA15 and PA5->PB3); in
+     * slave mode the kernel clock is only used internally for FIFO sync, but
+     * we still need it ticking. The PLLI2S has already been configured in
+     * the SPI1 branch above; calling HAL_RCCEx_PeriphCLKConfig again with
+     * the same values is a no-op. */
+
+    /* Peripheral clock enable */
+    __HAL_RCC_SPI3_CLK_ENABLE();
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /**I2S3 GPIO Configuration
+    PA15    ------> I2S3_WS   (slave WS input — wire jumper from PA4)
+    PB3     ------> I2S3_CK   (slave BCLK input — wire jumper from PA5)
+    PB5     ------> I2S3_SD   (data line for mic3 SEL=GND and mic4 SEL=VDD)
+
+    Note: PA15 and PB3 default to JTAG (JTDI / JTDO) at reset. Selecting
+    AF6 on them remaps them to I2S3 and frees the JTAG signals; SWD on
+    PA13/PA14 keeps working so the debugger is unaffected.
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_5;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* I2S3 DMA Init — same shape as SPI1 so a 1:1 index mapping holds
+     * between i2s1_rx_buf[] and i2s3_rx_buf[]. Different DMA controller
+     * (DMA1) so master and slave streams don't contend on the bus. */
+    hdma_spi3_rx.Instance = DMA1_Stream0;
+    hdma_spi3_rx.Init.Channel = DMA_CHANNEL_0;
+    hdma_spi3_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_spi3_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi3_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi3_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    hdma_spi3_rx.Init.MemDataAlignment = DMA_MDATAALIGN_WORD;
+    hdma_spi3_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_spi3_rx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_spi3_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_spi3_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(hi2s,hdmarx,hdma_spi3_rx);
+  }
 
 }
 
@@ -175,6 +235,20 @@ void HAL_I2S_MspDeInit(I2S_HandleTypeDef* hi2s)
     /* USER CODE BEGIN SPI1_MspDeInit 1 */
 
     /* USER CODE END SPI1_MspDeInit 1 */
+  }
+  else if(hi2s->Instance==SPI3)
+  {
+    __HAL_RCC_SPI3_CLK_DISABLE();
+
+    /**I2S3 GPIO Configuration
+    PA15    ------> I2S3_WS
+    PB3     ------> I2S3_CK
+    PB5     ------> I2S3_SD
+    */
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_15);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_3|GPIO_PIN_5);
+
+    HAL_DMA_DeInit(hi2s->hdmarx);
   }
 
 }

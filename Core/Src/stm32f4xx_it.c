@@ -57,6 +57,7 @@
 /* External variables --------------------------------------------------------*/
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
 extern DMA_HandleTypeDef hdma_spi1_rx;
+extern DMA_HandleTypeDef hdma_spi3_rx;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -211,6 +212,20 @@ void DMA2_Stream0_IRQHandler(void)
   /* USER CODE BEGIN DMA2_Stream0_IRQn 1 */
 
   /* USER CODE END DMA2_Stream0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA1 stream0 global interrupt.
+  *
+  * Used by SPI3/I2S3 RX (slave of the mic array). We still service the
+  * IRQ — that's what lets HAL clear the HT/TC flags and keep the circular
+  * DMA running cleanly — but the actual data combining/pushing happens in
+  * the SPI1 (master) callback. The HAL_I2S_RxHalfCplt/RxCplt callbacks in
+  * main.c short-circuit when called for SPI3.
+  */
+void DMA1_Stream0_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_spi3_rx);
 }
 
 /**

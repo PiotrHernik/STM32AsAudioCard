@@ -80,8 +80,11 @@ USBD_ClassTypeDef USBD_AUDIO_MIC = {
 #define AUDIO_PKT_LO   ((uint8_t)((AUDIO_MIC_PACKET_SIZE)      & 0xFFU))
 #define AUDIO_PKT_HI   ((uint8_t)((AUDIO_MIC_PACKET_SIZE >> 8) & 0xFFU))
 
-/* Length of the AC interface "collection" (header + IT + FU + OT) */
-#define AUDIO_MIC_AC_TOTAL_LEN     (9U + 12U + 9U + 9U)   /* = 39 */
+/* Length of the AC interface "collection" (header + IT + FU + OT).
+ * Feature Unit grows with channel count: bLength = 7 + (nrCh+1)*bControlSize.
+ * For 4 channels with 1-byte controls: bLength = 7 + 5 = 12. */
+#define AUDIO_MIC_FU_LEN           (7U + (USBD_AUDIO_MIC_CHANNELS + 1U) * 1U)
+#define AUDIO_MIC_AC_TOTAL_LEN     (9U + 12U + AUDIO_MIC_FU_LEN + 9U)   /* = 42 */
 
 __ALIGN_BEGIN static uint8_t USBD_AUDIO_MIC_CfgDesc[USBD_AUDIO_MIC_CONFIG_DESC_SIZ] __ALIGN_END = {
     /* ===== Configuration descriptor (9) ===== */
@@ -123,21 +126,29 @@ __ALIGN_BEGIN static uint8_t USBD_AUDIO_MIC_CfgDesc[USBD_AUDIO_MIC_CONFIG_DESC_S
     AUDIO_MIC_INPUT_TERMINAL_ID,       /* bTerminalID = 1 */
     0x01, 0x02,                        /* wTerminalType = 0x0201 Microphone */
     0x00,                              /* bAssocTerminal */
-    USBD_AUDIO_MIC_CHANNELS,           /* bNrChannels */
-    0x00, 0x00,                        /* wChannelConfig = 0 (Mono) */
+    USBD_AUDIO_MIC_CHANNELS,           /* bNrChannels = 4 */
+    0x00, 0x00,                        /* wChannelConfig = 0 (non-predefined:
+                                          host treats this as 4 independent
+                                          input channels, which is exactly
+                                          what a generic mic array is) */
     0x00,                              /* iChannelNames */
     0x00,                              /* iTerminal */
 
-    /* ===== Feature Unit (9) ===== */
-    /* bLength = 7 + (ch+1)*bControlSize = 7 + 2*1 = 9 */
-    0x09,
+    /* ===== Feature Unit (12) =====
+     * bLength = 7 + (ch+1)*bControlSize = 7 + 5*1 = 12.
+     * Master mute affects the whole stream; per-channel bmaControls left at
+     * 0 (no per-channel controls — there's no analog gain on these mics). */
+    AUDIO_MIC_FU_LEN,
     0x24,                              /* CS_INTERFACE */
     0x06,                              /* FEATURE_UNIT */
     AUDIO_MIC_FEATURE_UNIT_ID,         /* bUnitID = 2 */
     AUDIO_MIC_INPUT_TERMINAL_ID,       /* bSourceID = 1 */
     0x01,                              /* bControlSize = 1 byte per channel */
     0x01,                              /* bmaControls(0) master: Mute */
-    0x00,                              /* bmaControls(1) ch1:    none */
+    0x00,                              /* bmaControls(1) ch1 (mic1): none */
+    0x00,                              /* bmaControls(2) ch2 (mic2): none */
+    0x00,                              /* bmaControls(3) ch3 (mic3): none */
+    0x00,                              /* bmaControls(4) ch4 (mic4): none */
     0x00,                              /* iFeature */
 
     /* ===== Output Terminal: USB Streaming (9) ===== */

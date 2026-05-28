@@ -45,27 +45,39 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2S_HandleTypeDef hi2s1;
+I2S_HandleTypeDef hi2s3;
 DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi3_rx;
 
 /* USER CODE BEGIN PV */
-/* I2S DMA buffer.
- * I2S sends stereo frames (L+R), each a 24-bit sample left-justified in a
- * 32-bit channel slot. With DMA configured as PSIZE=HALFWORD + MSIZE=WORD
- * (see HAL_I2S_MspInit), the DMA packs every two 16-bit reads from SPI_DR
- * into one 32-bit memory write. So each uint32 in i2s_rx_buf holds exactly
+/* I2S DMA buffers — one per peripheral, both shaped identically so the
+ * same slot index in each buffer corresponds to the same physical moment
+ * in time. That's true because SPI1 (master) drives BCLK/WS while SPI3
+ * (slave) listens to the very same signals via two short jumper wires
+ * (PA4->PA15 for WS, PA5->PB3 for BCLK). Both peripherals therefore
+ * latch on identical clock edges and their DMAs advance in lockstep.
+ *
+ * I2S sends stereo frames (L+R), each a 24-bit sample left-justified in
+ * a 32-bit channel slot. With DMA configured as PSIZE=HALFWORD +
+ * MSIZE=WORD (see HAL_I2S_MspInit), the DMA packs every two 16-bit reads
+ * from SPI_DR into one 32-bit memory write. So each uint32 holds exactly
  * one full 32-bit audio slot (one channel), in this layout:
  *     bits  0..15  = upper 16 bits of the 24-bit sample (bits 23..8)
  *     bits 16..31  = lower 8 bits (left-justified, padded with zeros)
  *
- * I2S_BUF_SIZE = number of uint32 channel slots in the buffer
- *              = number of mono audio samples per buffer (after dropping R)
- *              × 2 (for stereo)
- * At 16 kHz, 64 slots = 32 stereo frames = 32 mono samples = 2 ms total,
- * so each half-complete callback covers exactly 1 ms (16 mono samples),
- * matching one USB 1 ms isochronous frame.
+ * I2S_BUF_SIZE = uint32 channel slots per buffer = 2 mic samples per buffer
+ *                slot × 2 (stereo: SEL=GND in L, SEL=VDD in R).
+ * At 16 kHz, 64 slots = 32 stereo frames = 2 ms total, so each
+ * half-complete callback covers exactly 1 ms (16 frames = 16 samples per
+ * mic), matching one USB 1 ms isochronous frame.
+ *
+ * The two buffers together carry 4 channels (mic1+mic2 in i2s1, mic3+mic4
+ * in i2s3); we interleave them into the USB ring inside the master's
+ * DMA callback.
  */
 #define I2S_BUF_SIZE 64
-uint32_t i2s_rx_buf[I2S_BUF_SIZE];
+uint32_t i2s1_rx_buf[I2S_BUF_SIZE];
+uint32_t i2s3_rx_buf[I2S_BUF_SIZE];
 extern USBD_HandleTypeDef hUsbDeviceFS;
 /* USER CODE END PV */
 
@@ -74,6 +86,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2S1_Init(void);
+static void MX_I2S3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -114,6 +127,7 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2S1_Init();
+  MX_I2S3_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   // DMA startuje dopiero po enumeracji USB (w pętli głównej)
@@ -130,16 +144,22 @@ int main(void)
        * audio samples (24-bit in 32-bit slots), and internally doubles it
        * to NDTR (half-word transfers). With PSIZE=HALFWORD + MSIZE=WORD,
        * the DMA packs every two 16-bit reads from SPI_DR into one 32-bit
-       * memory write — so each uint32 in i2s_rx_buf holds exactly one
-       * 32-bit audio channel slot (low 16 bits = upper 16 bits of the
-       * 24-bit sample, high 16 bits = the remaining 8 bits left-justified).
+       * memory write — so each uint32 in i2sX_rx_buf holds exactly one
+       * 32-bit audio channel slot.
        *
        * Sizing: I2S_BUF_SIZE (= 64) audio samples = 32 stereo frames
        *   -> HAL NDTR = 128 half-word reads
-       *   -> 64 word writes to memory = exactly i2s_rx_buf (256 bytes)
+       *   -> 64 word writes to memory = exactly i2sX_rx_buf (256 bytes)
        *   -> half-complete fires every 16 stereo frames = 1 ms @ 16 kHz
-       *      (matches one USB isochronous frame). */
-      HAL_I2S_Receive_DMA(&hi2s1, (uint16_t*)i2s_rx_buf, I2S_BUF_SIZE);
+       *      (matches one USB isochronous frame).
+       *
+       * Start order is critical for sample-accurate sync between the two
+       * peripherals: arm the SLAVE first so it's already listening on
+       * PA15/PB3 when the master starts driving them. The slave then locks
+       * onto the very first WS edge the master generates and both DMAs
+       * advance in lockstep from sample 0 onward. */
+      HAL_I2S_Receive_DMA(&hi2s3, (uint16_t*)i2s3_rx_buf, I2S_BUF_SIZE);
+      HAL_I2S_Receive_DMA(&hi2s1, (uint16_t*)i2s1_rx_buf, I2S_BUF_SIZE);
       dma_started = 1;
     }
     /* USER CODE END WHILE */
@@ -195,7 +215,9 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief I2S1 Initialization Function
+  * @brief I2S1 Initialization Function — MASTER RX for mic1 + mic2.
+  *        Generates BCLK on PA5 and WS on PA4; those signals are wired
+  *        (jumpered) to PA15/PB3 so I2S3 (slave) sees the same clocks.
   * @param None
   * @retval None
   */
@@ -229,19 +251,58 @@ static void MX_I2S1_Init(void)
 }
 
 /**
+  * @brief I2S3 Initialization Function — SLAVE RX for mic3 + mic4.
+  *        Receives BCLK on PB3 and WS on PA15 from external jumper wires
+  *        coming from the master (PA5 and PA4 respectively). All Init
+  *        fields except Mode must match the master so the two FIFOs
+  *        interpret the same bitstream identically.
+  * @param None
+  * @retval None
+  */
+static void MX_I2S3_Init(void)
+{
+  hi2s3.Instance = SPI3;
+  hi2s3.Init.Mode = I2S_MODE_SLAVE_RX;
+  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat = I2S_DATAFORMAT_24B;
+  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
+  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_16K;
+  hi2s3.Init.CPOL = I2S_CPOL_LOW;
+  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
 {
 
-  /* DMA controller clock enable */
+  /* DMA controller clock enable.
+   * Master (SPI1_RX) lives on DMA2 Stream 0 Ch 3, slave (SPI3_RX) on
+   * DMA1 Stream 0 Ch 0 — different controllers so they don't share the
+   * AHB master port and can't starve each other. */
+  __HAL_RCC_DMA1_CLK_ENABLE();
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA2_Stream0_IRQn interrupt configuration */
-  /* Priorytet niższy niż USB OTG (0,0) aby uniknąć wyścigu */
+  /* Priorytet niższy niż USB OTG (0,0) aby uniknąć wyścigu.
+   * Master callback (SPI1) is where we combine both buffers and push to
+   * the USB ring, so it absolutely must not preempt the USB IRQ. */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+  /* DMA1_Stream0_IRQn — SPI3 (slave) RX.
+   * Same preemption level as the master DMA; the callback is a no-op
+   * (just used so HAL keeps the HT/TC flags clean) so subpriority is
+   * irrelevant. */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 1, 1);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
 
@@ -290,30 +351,61 @@ static inline int32_t i2s_slot_to_int32(uint32_t frame)
     return (int32_t)(((uint32_t)hi << 16) | (uint32_t)lo);
 }
 
-/* Convert one half of the I2S DMA buffer into mono int32 samples and push
- * them to the USB microphone class ring buffer. The ICS43434 is a mono
- * mic; with L/R = GND it puts data on the left channel slot, so we take
- * every other uint32 (even indices = L slots, odd = R slot which is mute). */
-static void mic_push_half(const uint32_t *frames, uint16_t slot_count)
+/* Combine one half of BOTH I2S DMA buffers into interleaved 4-channel
+ * samples and push them to the USB microphone class ring buffer.
+ *
+ * Per ICS43434:
+ *   SEL=GND -> mic transmits during the LEFT half of WS  (= even slot)
+ *   SEL=VDD -> mic transmits during the RIGHT half of WS (= odd slot)
+ *
+ * Our wiring is:
+ *   mic1: I2S1 SD, SEL=GND -> i2s1_rx_buf[even]
+ *   mic2: I2S1 SD, SEL=VDD -> i2s1_rx_buf[odd]
+ *   mic3: I2S3 SD, SEL=GND -> i2s3_rx_buf[even]
+ *   mic4: I2S3 SD, SEL=VDD -> i2s3_rx_buf[odd]
+ *
+ * Because BCLK/WS are physically shared between SPI1 and SPI3, slot index
+ * i in i2s1_rx_buf and slot index i in i2s3_rx_buf reference the exact
+ * same physical I2S frame -> no time offset between channels.
+ *
+ * We emit one interleaved 4-ch frame per stereo slot pair:
+ *   [mic1, mic2, mic3, mic4, mic1, mic2, mic3, mic4, ...]
+ *
+ * slot_count is the number of channel slots covered by this callback
+ * (== I2S_BUF_SIZE / 2 == 32 for 1 ms at 16 kHz with the current buffer). */
+static void mic_push_half(uint16_t slot_offset, uint16_t slot_count)
 {
-    int32_t mono[I2S_BUF_SIZE / 4]; /* worst case = 16 samples per 1 ms */
+    const uint32_t *m = &i2s1_rx_buf[slot_offset];
+    const uint32_t *s = &i2s3_rx_buf[slot_offset];
+
+    /* Worst case: 16 frames * 4 channels = 64 samples per 1 ms callback. */
+    int32_t out[(I2S_BUF_SIZE / 2) * 2];
     uint16_t n = 0U;
     for (uint16_t i = 0U; i < slot_count; i += 2U) {
-        mono[n++] = i2s_slot_to_int32(frames[i]);
+        out[n++] = i2s_slot_to_int32(m[i]);       /* mic1: master L */
+        out[n++] = i2s_slot_to_int32(m[i + 1U]);  /* mic2: master R */
+        out[n++] = i2s_slot_to_int32(s[i]);       /* mic3: slave  L */
+        out[n++] = i2s_slot_to_int32(s[i + 1U]);  /* mic4: slave  R */
     }
-    USBD_AUDIO_MIC_PushSamples(mono, n);
+    USBD_AUDIO_MIC_PushSamples(out, n);
 }
 
+/* Only the MASTER (SPI1) callbacks drive the USB pump. The slave (SPI3)
+ * IRQ still fires — that's what lets HAL clear its HT/TC flags — but the
+ * payload is consumed from i2s3_rx_buf inside the master callback, where
+ * we already know the lock-step DMA index. */
 void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-    (void)hi2s;
-    mic_push_half(&i2s_rx_buf[0], I2S_BUF_SIZE / 2);
+    if (hi2s->Instance == SPI1) {
+        mic_push_half(0U, I2S_BUF_SIZE / 2U);
+    }
 }
 
 void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-    (void)hi2s;
-    mic_push_half(&i2s_rx_buf[I2S_BUF_SIZE / 2], I2S_BUF_SIZE / 2);
+    if (hi2s->Instance == SPI1) {
+        mic_push_half(I2S_BUF_SIZE / 2U, I2S_BUF_SIZE / 2U);
+    }
 }
 /* USER CODE END 4 */
 

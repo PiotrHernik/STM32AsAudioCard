@@ -1,12 +1,19 @@
 /**
   ******************************************************************************
   * @file    usbd_audio_mic.h
-  * @brief   USB Audio Class 1.0 microphone (IN) implementation.
-  *          Mono, 24-bit PCM packed in 3 bytes (S24_3LE), fixed sample rate.
-  *          Designed as a drop-in replacement for the ST USBD_AUDIO class
-  *          when the device must act as a USB microphone with full dynamic
-  *          range (ICS43434 outputs 24-bit data on I2S, and the lower bits
-  *          contain real signal that we don't want to truncate in firmware).
+  * @brief   USB Audio Class 1.0 microphone array (IN) implementation.
+  *          4-channel interleaved, 24-bit PCM packed in 3 bytes (S24_3LE),
+  *          fixed sample rate. Sources 4 ICS43434 microphones sharing one
+  *          BCLK/WS pair (sample-aligned in hardware): two mics per I2S
+  *          data line, distinguished by the L/R SEL pin.
+  *
+  *          Per-frame channel order on the USB wire (interleaved):
+  *              [mic1, mic2, mic3, mic4, mic1, mic2, mic3, mic4, ...]
+  *          where
+  *              mic1 = I2S1 SD, SEL=GND  (master, L slot)
+  *              mic2 = I2S1 SD, SEL=VDD  (master, R slot)
+  *              mic3 = I2S3 SD, SEL=GND  (slave,  L slot)
+  *              mic4 = I2S3 SD, SEL=VDD  (slave,  R slot)
   ******************************************************************************
   */
 
@@ -23,16 +30,18 @@ extern "C" {
 #ifndef USBD_AUDIO_MIC_FREQ
 #define USBD_AUDIO_MIC_FREQ                 16000U
 #endif
-#define USBD_AUDIO_MIC_CHANNELS             1U
+#define USBD_AUDIO_MIC_CHANNELS             4U
 #define USBD_AUDIO_MIC_BITS                 24U
 #define USBD_AUDIO_MIC_BYTES_PER_SAMPLE     3U  /* S24_3LE: 24-bit packed in 3 bytes */
 
 /* Bytes per 1ms USB frame (one isochronous packet).
- *   16 kHz * 1 channel * 3 bytes = 48 bytes/ms — well within FS isoc limits. */
+ *   16 kHz * 4 channels * 3 bytes = 192 bytes/ms — well within FS isoc limits
+ *   (max 1023 B per isoc microframe). */
 #define AUDIO_MIC_PACKET_SIZE \
     ((USBD_AUDIO_MIC_FREQ / 1000U) * USBD_AUDIO_MIC_CHANNELS * USBD_AUDIO_MIC_BYTES_PER_SAMPLE)
 
-/* Samples per packet (one sample = one 24-bit value). */
+/* "Samples" here = individual channel values (NOT frames). One 1 ms packet
+ * carries 16 frames * 4 channels = 64 channel-samples. */
 #define AUDIO_MIC_PACKET_SAMPLES            (AUDIO_MIC_PACKET_SIZE / USBD_AUDIO_MIC_BYTES_PER_SAMPLE)
 
 /* ===== USB topology constants ===== */
@@ -45,12 +54,16 @@ extern "C" {
 #define AUDIO_MIC_FEATURE_UNIT_ID           0x02U
 #define AUDIO_MIC_OUTPUT_TERMINAL_ID        0x03U
 
-/* Total length of the configuration descriptor. */
-#define USBD_AUDIO_MIC_CONFIG_DESC_SIZ      0x6DU
+/* Total length of the configuration descriptor.
+ * Compared to the mono variant the Feature Unit gained 3 extra per-channel
+ * bmaControls bytes (bLength: 9 -> 12), so the whole config grew by 3 bytes:
+ *   0x6D (109) -> 0x70 (112). */
+#define USBD_AUDIO_MIC_CONFIG_DESC_SIZ      0x70U
 
 /* ===== Ring buffer sizing =====
  * Holds AUDIO_MIC_RING_PACKETS worth of 1ms packets to absorb jitter between
- * the I2S producer and the USB consumer. 8 ms is plenty for 16 kHz mono.
+ * the I2S producer and the USB consumer. 8 ms at 4 ch / 16 kHz = 512 slots
+ * (2 KiB), still trivial on the F411's 128 KiB SRAM.
  */
 #define AUDIO_MIC_RING_PACKETS              8U
 #define AUDIO_MIC_RING_SAMPLES              (AUDIO_MIC_PACKET_SAMPLES * AUDIO_MIC_RING_PACKETS)
@@ -98,12 +111,13 @@ typedef struct {
 extern USBD_ClassTypeDef USBD_AUDIO_MIC;
 #define USBD_AUDIO_MIC_CLASS &USBD_AUDIO_MIC
 
-/* Producer API: push `count` mono samples into the ring buffer.
- * Each sample is a raw 32-bit I2S slot value: 24-bit signed sample in
- * bits [31:8] (sign-extended for negative samples), bits [7:0] = 0.
- * This matches what the I2S DMA delivers, so no conversion is required
- * on the producer side. Safe to call from an interrupt at lower priority
- * than the USB IRQ. */
+/* Producer API: push `count` channel-samples into the ring buffer in the
+ * exact order they should appear on the USB wire. For the 4-mic array that
+ * means interleaved frames of 4 ints: [m1, m2, m3, m4, m1, m2, m3, m4, ...].
+ * Each int32 is a raw 32-bit I2S slot value: 24-bit signed sample in bits
+ * [31:8] (sign-extended), bits [7:0] = 0. This matches what the I2S DMA
+ * delivers, so no conversion is needed on the producer side. Safe to call
+ * from an interrupt at lower priority than the USB IRQ. */
 void USBD_AUDIO_MIC_PushSamples(const int32_t *samples, uint16_t count);
 
 #ifdef __cplusplus
